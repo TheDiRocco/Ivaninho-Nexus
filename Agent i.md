@@ -1,1 +1,101 @@
-Coming soon
+Agent i — Technical Overview
+================================
+
+Version: 1.0
+Date: 2026-01-10
+
+Summary
+-------
+This project is my first AI agent, introducing me to large panel of AI notions.
+Agent i is an AI agent put in production but intended for technical demonstration. It is assembled and hosted in Azure AI Foundry and benefits from complementary MCP/RAG toolset to enhance it's capabilities. The project focuses on strong operational security (CIS-aligned controls) protecting the endpoint and its backend ressources.
+
+This document provides an architect-level presentation of the solution: goals, architecture, key features, technology rationale, operational considerations, open questions for validation, and a recommended next steps list.
+
+Goals and value proposition
+---------------------------
+- Provide an API that lets users send conversational requests to a hosted agent (Azure AI Foundry).
+- Centralize identity validation through a hardened auth-service + reverse proxy and minimize upstream load with a short-lived validation cache.
+- Contains a small, maintainable data pipeline (document splitter → embedding → vector index) for contextual retrieval and RAG scenarios. (Not public, this is an internal feature non-automated to make me practice data embedding)
+- Make the system deployable locally (Dockerized) and to ACA (Azure Container Apps).
+
+Key features (what it delivers)
+-------------------------------
+ - Secure JWT-based authentication: dual-token model where the access token (Bearer) is the authentication credential validated by an external auth-service; the refresh token (HTTP-only cookie) is used for session refresh (not as the primary authentication credential). CSRF protection is applied for cookie-based session flows.
+- Token validation caching: in-memory TTL cache (60s) to reduce auth-service load while retaining near-real-time revocation characteristics.
+- Auth-aware rate limiting: per-user (token-hash) limits via an application-level limiter and fallback to IP-based controls.
+- Hardened HTTP surface: CORS restricted by environment, strict CSP in production, HSTS, X-Frame-Options, X-Content-Type-Options, and request tracing headers (X-Request-ID).
+- Agent execution path: API accepts chat requests, authorizes them, uses a managed identity credential to call the agent endpoint (With RBAC), and returns the model response with metrics captured.
+- Observability primitives: lightweight metrics (request counts, Azure latency averages, cache hit/miss stats) exposed via a protected metrics endpoint.
+- Data-foundry pipeline: document splitter, embedder, and uploader utilities to create vector indexes in Azure Search for contextual retrieval.
+- Local orchestration and production path: Docker Compose for local dev; Azure Container Apps + ACR + Managed Identity recommended for production.
+
+Public API surface (summary)
+----------------------------
+All endpoints are grouped under a custom prefix. Primary endpoints:
+- `GET /health` - operational health (readiness) with timestamp (rate-limited stronger).
+- `GET /metrics` - runtime metrics including auth cache stats (protected).
+- `POST /chat` - send a chat message; validated message schema, content-safety checks, and rate-limited at 20 req/min per authenticated user.
+
+Authentication & Authorization
+------------------------------
+Design:
+- The API is usable under JWT validation only. Authentication process is delegated to an external auth-service behind a NGINX reverse proxy.
+- A short, local TTL cache (60s) stores validated token payloads, reducing auth-service calls while accepting up to a 60-second delay for revocation semantics.
+
+- The API enforces JWT validation for authentication; validation is delegated to an external auth-service behind NGINX (Nexus project).
+- Access tokens are accepted via HTTP header : `Authorization: Bearer <token>` and are the primary authentication mechanism. A refresh token (HTTP-only cookie) is used for session management (to obtain new access tokens) — not as the primary authentication credential.
+- For cookie-based session flows, CSRF protection is applied to prevent cross-site request forgery (the implementation requires a CSRF token header or double-submit cookie as refresh token is a httpOnly cookie).
+- A short, local TTL cache (60s) stores validated access token payloads, reducing auth-service calls while accepting up to a 60-second delay for revocation semantics.
+
+Operational behavior:
+- A custom key function hashes the token for per-user rate limiting. IP-based fallback exists if no token is present.
+- Environment toggle `REQUIRE_AUTH` allows anonymous access in development but in production always set to TRUE.
+
+Architecture (logical overview)
+-------------------------------
+Core components:
+- API layer: FastAPI application handling authentication, rate limiting, security headers, and routing.
+- Auth-service: external service reachable at `NGINX_URL` implementing `/api/token-verify` (Not actual endpoint).
+- Azure AI Foundry: hosted agent projects invoked using Microsoft Agent Framewor using ManagedIdentityCredential or AzureDefaultCredential in production.
+- MCP/Massive API: supplemental microservice providing simple market data/tools via SSE to enrich agent responses.
+- Data-Foundry(internal/dev only): offline pipeline that produces embeddings and uploads vector data to Azure AI Search for RAG.
+- Deployment infra: Docker (local) and Azure Container Apps (production), using Managed Identity for credentials.
+
+Simple dataflow (chat request):
+Client -> API (/api/agenti/chat) -> token extraction -> cache lookup -> (if miss) auth-service POST /api/token-verify -> authorize -> obtain credential (ManagedIdentityCredential) -> call Azure AI application endpoint -> return model output -> update metrics
+
+Security controls and rationale
+-------------------------------
+- Delegated auth-service: centralizes token issuance and revocation, keeps API stateless regarding token lifecycle. Short TTL cache is a pragmatic compromise between latency and revocation speed.
+- Managed Identity for Azure calls: avoids embedding secrets in the service and enables least privilege via Azure role assignments.
+- Network-level and app-level rate limiting: slowapi per-user limiter combined with recommended NGINX-level limits to address burst abuse and bot traffic.
+- CSP, HSTS and related headers: reduce XSS, clickjacking and other browser-based attacks, while allowing limited relaxations for developer docs.
+- TrustedHostMiddleware: optional enforcement of allowed hostnames in production to reduce host header attacks.
+- Every secrets are stored in Azure Key vault and KV address is given in env variables.
+
+Technology choices and justification
+-----------------------------------
+- FastAPI: asynchronous by design, excellent OpenAPI generation for clarity, performant for I/O-bound workloads (calls to Azure and other services). Ideal for building a production API that is easy to document and maintain. Swagger and it's /docs enpoint also being very useful to dev.
+- Pydantic models: provide strict input validation and small, auditable schemas for request/response contracts, reducing attack surface and easing automatic docs.
+- Async HTTP & Azure SDK: async httpx and AsyncOpenAI/Azure identity SDKs allow non-blocking calls to the agent platform, supporting concurrency and lower latency at scale.
+- ManagedIdentityCredential / DefaultAzureCredential: follows Azure best practices; Managed Identity for production avoids secret sprawl; DefaultAzureCredential eases developer experience locally.
+- cachetools (TTLCache): simple, dependency-light local cache for token validation, sufficient for single-instance or non-highly-distributed deployments. Redis is in mind but too costly for the use case of the project.
+- slowapi limiter: pragmatic integration for FastAPI; token-hash key function enables per-user rate limiting without full session state.
+- Docker + Azure Container Apps: containerization provides reproducible builds and aligns with Azure-managed container hosting and CI/CD flows.
+
+Operational considerations (architect-level)
+------------------------------------------
+1. Token revocation and cache coherence
+   - In multi-instance deployments, replace in-memory TTLCache with a shared cache (Redis) and provide an invalidation mechanism.
+2. Observability
+   - Add structured logging and export metrics/traces (Prometheus/OpenTelemetry/Azure Monitor). Current metrics endpoint is useful but insufficient for SLO monitoring.
+   - I have to admit monitoring is a weak point in my projects while I know it is very important for large-scale deployment (and not only).
+3. Scaling and Azure quotas
+   - Plan capacity for Azure AI calls (expected RPS), define backpressure and request queuing; implement retries with exponential backoff and respect Retry-After.
+   - implementing an API Gateway
+4. Dependency management
+   - Pin stable versions of Azure SDKs; avoid experimental SDKs in production without compatibility testing.
+
+---
+
+(End of technical documentation, if I find time I will do my best to make it better and more complete)
